@@ -47,7 +47,7 @@ setup_database()
     "astrobot_plugin_who_at_me",
     "长安某",
     "记录并查询@我的消息",
-    "2.0.0-nonblocking",
+    "1.0.0",
     "https://github.com/zgojin/aastrobot_plugin_who_at_me",
 )
 class AtRecorderPlugin(Star):
