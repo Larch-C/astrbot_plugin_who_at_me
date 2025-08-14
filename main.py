@@ -1,24 +1,175 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+import os
+import pickle
+import re
+import sqlite3
+import time
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Node, Nodes, Plain
+from astrbot.api.star import Context, Star, register
+
+plugin_dir = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(plugin_dir, "at_records.db")
+RECORD_EXPIRATION_SECONDS = 86400  # @记录保留24小时
+
+
+def setup_database():
+    """初始化插件数据库，确保表结构存在"""
+    try:
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS at_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at_user_id TEXT NOT NULL,
+                    sender_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    message_chain_pickle BLOB NOT NULL,
+                    timestamp INTEGER NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timestamp ON at_records (timestamp);"
+            )
+        logger.info("插件 'astrobot_plugin_who_at_me' 数据库初始化成功")
+    except Exception as e:
+        logger.error(f"插件 'astrobot_plugin_who_at_me' 数据库初始化失败: {e}")
+
+
+# 在插件加载时初始化数据库
+setup_database()
+
+
+@register(
+    "astrobot_plugin_who_at_me",
+    "长安某",
+    "记录并查询@我的消息",
+    "1.0.0",
+    "https://github.com/zgojin/aastrobot_plugin_who_at_me",
+)
+class AtRecorderPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        logger.info("插件 'astrobot_plugin_who_at_me' 已加载")
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-    
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    def _cleanup_old_records(self):
+        """清理过期的@记录"""
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cutoff_timestamp = int(time.time()) - RECORD_EXPIRATION_SECONDS
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM at_records WHERE timestamp < ?", (cutoff_timestamp,)
+                )
+        except Exception as e:
+            logger.error(f"插件 'astrobot_plugin_who_at_me' 清理旧@记录时出错: {e}")
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def record_at_message(self, event: AstrMessageEvent):
+        """监听并记录群聊中的@消息"""
+        if re.fullmatch(r"^(谁艾特我|谁@我|谁@我了)[?？]?$", event.message_str):
+            return
+
+        self._cleanup_old_records()
+
+        at_user_ids = [
+            str(component.qq)
+            for component in event.message_obj.message
+            if isinstance(component, At)
+        ]
+
+        if not at_user_ids:
+            return
+
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                sender_id = event.get_sender_id()
+                sender_name = event.get_sender_name()
+                group_id = event.get_group_id()
+                message_chain_pickle = pickle.dumps(event.message_obj.message)
+                timestamp = event.message_obj.timestamp
+
+                cursor = conn.cursor()
+                for at_user_id in at_user_ids:
+                    cursor.execute(
+                        "INSERT INTO at_records (at_user_id, sender_id, sender_name, group_id, message_chain_pickle, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            at_user_id,
+                            sender_id,
+                            sender_name,
+                            group_id,
+                            message_chain_pickle,
+                            timestamp,
+                        ),
+                    )
+        except Exception as e:
+            logger.error(
+                f"插件 'astrobot_plugin_who_at_me' 写入@记录到数据库时出错: {e}"
+            )
+
+    @filter.regex(r"^(谁艾特我|谁@我|谁@我了)[?？]?$")
+    async def who_at_me(self, event: AstrMessageEvent):
+        """响应用户查询，合并转发所有相关的@消息"""
+        if not event.get_group_id():
+            return
+
+        self._cleanup_old_records()
+        user_id = event.get_sender_id()
+        group_id = event.get_group_id()
+
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT sender_id, sender_name, message_chain_pickle FROM at_records WHERE (at_user_id = ? OR at_user_id = 'all') AND group_id = ? ORDER BY timestamp ASC",
+                    (user_id, group_id),
+                )
+                records = cursor.fetchall()
+
+                if not records:
+                    yield event.plain_result("最近24小时内在这个群里没有人@你哦")
+                    return
+
+                forward_nodes = []
+                for sender_id, sender_name, msg_pickle in records:
+                    original_message_chain = pickle.loads(msg_pickle)
+
+                    new_content = []
+                    if original_message_chain:
+                        for i, component in enumerate(original_message_chain):
+                            # 检查@提及后的纯文本，统一格式化"
+                            if (
+                                i > 0
+                                and isinstance(original_message_chain[i - 1], At)
+                                and isinstance(component, Plain)
+                                and component.text
+                            ):
+                                cleaned_text = component.text.lstrip(" \t\n:：,，.")
+                                new_content.append(Plain(text=f" {cleaned_text}"))
+                            else:
+                                new_content.append(component)
+
+                    node = Node(
+                        uin=sender_id,
+                        name=sender_name,
+                        content=new_content or original_message_chain,
+                    )
+                    forward_nodes.append(node)
+
+                yield event.chain_result([Nodes(nodes=forward_nodes)])
+
+                # 查询后清除该用户的@记录
+                cursor.execute(
+                    "DELETE FROM at_records WHERE at_user_id = ? AND group_id = ?",
+                    (user_id, group_id),
+                )
+
+        except Exception as e:
+            logger.error(f"插件 'astrobot_plugin_who_at_me' 查询或发送@记录时出错: {e}")
+            yield event.plain_result("处理你的请求时发生了一个内部错误")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        logger.info("插件 'astrobot_plugin_who_at_me' 已卸载")
