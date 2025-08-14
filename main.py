@@ -104,7 +104,6 @@ class AtRecorderPlugin(Star):
             )
             conn.commit()
 
-
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def record_at_message(self, event: AstrMessageEvent):
         """监听并记录群聊中的@消息。"""
