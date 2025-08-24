@@ -7,7 +7,7 @@ import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Node, Nodes, Plain
+from astrbot.api.message_components import At, Node, Nodes, Plain, Reply
 from astrbot.api.star import Context, Star, register
 
 plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +16,7 @@ RECORD_EXPIRATION_SECONDS = 86400
 
 
 def setup_database():
-    """初始化插件数据库，确保表结构存在。"""
+    """初始化插件数据库，确保表结构存在"""
     try:
         os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
         with sqlite3.connect(DB_FILE) as conn:
@@ -40,6 +40,7 @@ def setup_database():
         logger.error(f"插件 'astrobot_plugin_who_at_me' 数据库初始化失败: {e}")
 
 
+# 启动时初始化数据库
 setup_database()
 
 
@@ -47,7 +48,7 @@ setup_database()
     "astrobot_plugin_who_at_me",
     "长安某",
     "记录并查询@我的消息",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/zgojin/aastrobot_plugin_who_at_me",
 )
 class AtRecorderPlugin(Star):
@@ -57,7 +58,6 @@ class AtRecorderPlugin(Star):
         logger.info("插件 'astrobot_plugin_who_at_me' 已加载")
 
     def _db_cleanup_records(self):
-        """清理过期的@记录。"""
         try:
             with sqlite3.connect(DB_FILE) as conn:
                 cutoff_timestamp = int(time.time()) - RECORD_EXPIRATION_SECONDS
@@ -70,7 +70,6 @@ class AtRecorderPlugin(Star):
             logger.error(f"插件 'astrobot_plugin_who_at_me' 清理旧@记录时出错: {e}")
 
     def _db_write_records(self, records_to_insert: list):
-        """批量写入@记录。"""
         try:
             with sqlite3.connect(DB_FILE) as conn:
                 cursor = conn.cursor()
@@ -85,7 +84,6 @@ class AtRecorderPlugin(Star):
             )
 
     def _db_fetch_records(self, user_id: str, group_id: str):
-        """获取指定用户的@记录。"""
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -95,7 +93,6 @@ class AtRecorderPlugin(Star):
             return cursor.fetchall()
 
     def _db_delete_records(self, user_id: str, group_id: str):
-        """删除指定用户的@记录。"""
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -106,15 +103,22 @@ class AtRecorderPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def record_at_message(self, event: AstrMessageEvent):
-        """监听并记录群聊中的@消息。"""
         if re.fullmatch(r"^(谁艾特我|谁@我|谁@我了)[?？]?$", event.message_str):
             return
+
         await self.loop.run_in_executor(None, self._db_cleanup_records)
 
+        components_to_check = []
+        components_to_check.extend(event.message_obj.message)
+
+        for component in event.message_obj.message:
+            if isinstance(component, Reply) and hasattr(component, "chain"):
+                components_to_check.extend(component.chain)
+
         at_user_ids = [
-            str(component.qq)
-            for component in event.message_obj.message
-            if isinstance(component, At)
+            str(at_comp.qq)
+            for at_comp in components_to_check
+            if isinstance(at_comp, At)
         ]
 
         if not at_user_ids:
@@ -131,11 +135,13 @@ class AtRecorderPlugin(Star):
             for at_id in at_user_ids
         ]
 
-        await self.loop.run_in_executor(None, self._db_write_records, records_to_insert)
+        if records_to_insert:
+            await self.loop.run_in_executor(
+                None, self._db_write_records, records_to_insert
+            )
 
     @filter.regex(r"^(谁艾特我|谁@我|谁@我了)[?？]?$")
     async def who_at_me(self, event: AstrMessageEvent):
-        """响应用户查询，合并转发所有相关的@消息。"""
         if not event.get_group_id():
             return
 
@@ -156,35 +162,70 @@ class AtRecorderPlugin(Star):
             forward_nodes = []
             for sender_id, sender_name, msg_pickle in records:
                 original_message_chain = pickle.loads(msg_pickle)
-                new_content = []
-                if original_message_chain:
-                    for i, component in enumerate(original_message_chain):
-                        if (
-                            i > 0
-                            and isinstance(original_message_chain[i - 1], At)
-                            and isinstance(component, Plain)
-                            and component.text
-                        ):
+                final_content = []
+                reply_comp = next(
+                    (c for c in original_message_chain if isinstance(c, Reply)), None
+                )
+
+                if reply_comp:
+                    # 模拟的引用文本
+                    og_sender = reply_comp.sender_nickname
+                    og_text = reply_comp.message_str.strip()
+                    # 截断过长的被引用消息
+                    if len(og_text) > 40:
+                        og_text = og_text[:40] + "..."
+
+                    # 添加模拟的引用头
+                    final_content.append(Plain(text=f"「{og_sender}：{og_text}」\n"))
+
+                # 遍历原消息链
+                for i, component in enumerate(original_message_chain):
+                    if isinstance(component, Reply):
+                        continue
+                    elif isinstance(component, At):
+                        final_content.append(component)
+                    elif isinstance(component, Plain):
+                        # 如果文本在At后，清理多余字符
+                        if i > 0 and isinstance(original_message_chain[i - 1], At):
                             cleaned_text = component.text.lstrip(" \t\n:：,，.")
-                            new_content.append(Plain(text=f" {cleaned_text}"))
+                            if cleaned_text:
+                                final_content.append(Plain(text=f" {cleaned_text}"))
                         else:
-                            new_content.append(component)
+                            # 对于非回复消息，保留原样
+                            if not reply_comp:
+                                final_content.append(component)
+                            # 避免重复显示，只添加At后面的文本
+                            elif i > 0 and isinstance(
+                                original_message_chain[i - 1], At
+                            ):
+                                final_content.append(component)
+
+                if not final_content:
+                    continue
 
                 node = Node(
                     uin=sender_id,
                     name=sender_name,
-                    content=new_content or original_message_chain,
+                    content=final_content,
                 )
                 forward_nodes.append(node)
 
-            yield event.chain_result([Nodes(nodes=forward_nodes)])
+            if forward_nodes:
+                yield event.chain_result([Nodes(nodes=forward_nodes)])
+            else:
+                yield event.plain_result(
+                    "最近24小时内在这个群里没有人@你哦 (已过滤无效内容)"
+                )
 
             await self.loop.run_in_executor(
                 None, self._db_delete_records, user_id, group_id
             )
 
         except Exception as e:
-            logger.error(f"插件 'astrobot_plugin_who_at_me' 查询或发送@记录时出错: {e}")
+            logger.error(
+                f"插件 'astrobot_plugin_who_at_me' 查询或发送@记录时出错: {e}",
+                exc_info=True,
+            )
             yield event.plain_result("处理你的请求时发生了一个内部错误")
 
     async def terminate(self):
